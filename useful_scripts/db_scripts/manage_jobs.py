@@ -7,7 +7,7 @@ import os
 # Add the app directory to the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'app'))
 
-async def fix_stuck_jobs():
+async def manage_jobs():
     try:
         from app.database import AsyncSessionLocal
         from app.models import IngestionJob
@@ -49,4 +49,4 @@ async def fix_stuck_jobs():
         traceback.print_exc()
 
 if __name__ == "__main__":
-    asyncio.run(fix_stuck_jobs())
+    asyncio.run(manage_jobs())

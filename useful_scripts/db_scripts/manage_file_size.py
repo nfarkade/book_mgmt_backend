@@ -2,7 +2,7 @@ import asyncio
 import asyncpg
 from app.config import settings
 
-async def add_file_size_column():
+async def manage_file_size_column():
     conn = await asyncpg.connect(settings.DATABASE_URL.replace("+asyncpg", ""))
     
     try:
@@ -18,4 +18,4 @@ async def add_file_size_column():
         await conn.close()
 
 if __name__ == "__main__":
-    asyncio.run(add_file_size_column())
+    asyncio.run(manage_file_size_column())

@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models import Book
 
-async def add_sample_books():
+async def manage_books():
     async for db in get_db():
         # Sample books with authors and genres
         books = [
@@ -25,4 +25,4 @@ async def add_sample_books():
         break
 
 if __name__ == "__main__":
-    asyncio.run(add_sample_books())
+    asyncio.run(manage_books())
