@@ -97,7 +97,7 @@ LLM (LLaMA 3 via OpenRouter)
 
 ```bash
 git clone <repository-url>
-cd book_mgmt_agent
+cd book_mgmt_backend
 pip install -r requirements.txt
 ```
 
@@ -146,8 +146,6 @@ Access:
 - User & Role Management
 - Document Storage
 
-> Full API documentation is available via Swagger UI.
-
 ---
 
 ## 🧪 Testing
@@ -161,42 +159,8 @@ pytest tests/ -v
 Or:
 
 ```bash
-python run_tests.py
+python useful_scripts/test_scripts/run_tests.py
 ```
-
----
-
-## 🚦 Environments
-
-### Development
-- Local file storage
-- In-memory vector store
-- Minimal dependencies
-
-### Production
-- PostgreSQL
-- AWS S3 for documents
-- Secure secrets via environment variables
-
----
-
-## 🛣️ Roadmap
-- Persistent vector database (FAISS / Milvus)
-- Hybrid keyword + semantic search
-- Async background indexing
-- Multi-tenant SaaS support
-- Monitoring & observability
-
----
-
-## 🤝 Contributing
-1. Fork the repository  
-2. Create a feature branch  
-3. Add/update tests  
-4. Ensure all tests pass  
-5. Submit a pull request  
-
----
 
 ## 📄 License
 MIT License
