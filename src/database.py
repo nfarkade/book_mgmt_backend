@@ -1,7 +1,8 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
-from sqlalchemy.pool import NullPool
+from sqlalchemy.pool import QueuePool
 from sqlalchemy import event, text
+from sqlalchemy.pool import NullPool
 from app.config import settings
 from app.logging_config import get_logger
 import asyncio
@@ -10,14 +11,27 @@ import time
 
 logger = get_logger(__name__)
 
-# Production-grade engine configuration
+# Production-grade engine configuration with proper connection pooling
+# For asyncpg, we use QueuePool which is the recommended approach
 engine = create_async_engine(
     settings.DATABASE_URL,
     # Connection pool settings for production
-    poolclass=NullPool,  # Use NullPool for async engines
+    poolclass=QueuePool,  # Use QueuePool for better connection management
+    pool_size=settings.DB_POOL_SIZE,  # Number of connections to maintain
+    max_overflow=settings.DB_MAX_OVERFLOW,  # Additional connections beyond pool_size
+    pool_pre_ping=True,  # Verify connections before using them
+    pool_recycle=3600,  # Recycle connections after 1 hour
     # Performance settings
     echo=settings.DEBUG,  # SQL logging only in debug mode
     future=True,
+    # Connection timeout settings
+    connect_args={
+        "server_settings": {
+            "application_name": settings.APP_NAME,
+            "jit": "off"  # Disable JIT for better connection performance
+        },
+        "command_timeout": 30,  # 30 second command timeout
+    }
 )
 
 # Session factory with proper configuration

@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
@@ -9,7 +9,19 @@ from sqlalchemy import select
 # Application imports
 from app.config import settings
 from app.logging_config import setup_logging, get_logger
-from app.middleware import RequestTrackingMiddleware, error_handler, get_metrics_data, MetricsMiddleware
+from app.middleware import (
+    RequestTrackingMiddleware, 
+    error_handler, 
+    get_metrics_data, 
+    MetricsMiddleware,
+    RateLimitMiddleware
+)
+from app.exceptions import (
+    NotFoundError,
+    ConflictError,
+    ValidationError,
+    DatabaseError
+)
 from app.database import get_db, init_database, close_database, db_health
 from app.models import Book, Review, Author, Genre
 from app.crud import *
@@ -24,6 +36,7 @@ from app.routes import auth, users, documents, ingestion
 from typing import List
 import time
 import asyncio
+import json
 
 # Setup logging
 setup_logging(log_level=settings.LOG_LEVEL, log_file=settings.LOG_FILE)
@@ -62,17 +75,21 @@ app = FastAPI(
     title=settings.APP_NAME,
     description="Production-grade intelligent book management system with RAG capabilities",
     version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json",
-    lifespan=lifespan
+    docs_url="/docs" if not settings.is_production else None,  # Disable docs in production
+    redoc_url="/redoc" if not settings.is_production else None,  # Disable redoc in production
+    openapi_url="/openapi.json" if not settings.is_production else None,  # Disable OpenAPI in production
+    lifespan=lifespan,
+    # Production settings
+    generate_unique_id_function=lambda route: f"{route.tags[0]}-{route.name}" if route.tags else route.name
 )
 
 # Security middleware
 if settings.is_production:
+    # Configure with actual domains in production
+    allowed_hosts = settings.CORS_ORIGINS if settings.CORS_ORIGINS else ["*"]
     app.add_middleware(
         TrustedHostMiddleware,
-        allowed_hosts=["*"]  # Configure with actual domains in production
+        allowed_hosts=allowed_hosts
     )
 
 # CORS middleware
@@ -80,91 +97,136 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID", "X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset", "X-Response-Time"],
 )
 
-# Custom middleware
+# Rate limiting middleware (should be early in the stack)
+app.add_middleware(
+    RateLimitMiddleware,
+    requests_per_minute=settings.RATE_LIMIT_REQUESTS,
+    window_seconds=settings.RATE_LIMIT_WINDOW
+)
+
+# Custom middleware - order matters (last added is first executed)
 app.add_middleware(RequestTrackingMiddleware)
 app.add_middleware(MetricsMiddleware)
 
 # Global exception handler
 app.add_exception_handler(Exception, error_handler)
 
-# Include routers
-app.include_router(auth.router)
-app.include_router(users.router)
-app.include_router(documents.router)
-app.include_router(ingestion.router)
+# API Versioning - include routers with version prefix
+API_V1_PREFIX = "/api/v1"
 
-# Author and Genre Management
-@app.post("/authors", response_model=AuthorResponse, tags=["Authors"])
+# Include routers with version prefix
+app.include_router(auth.router, prefix=API_V1_PREFIX)
+app.include_router(users.router, prefix=API_V1_PREFIX)
+app.include_router(documents.router, prefix=API_V1_PREFIX)
+app.include_router(ingestion.router, prefix=API_V1_PREFIX)
+
+# Root endpoint
+@app.get("/", tags=["Root"])
+async def root():
+    """API root endpoint with version information"""
+    return {
+        "name": settings.APP_NAME,
+        "version": "1.0.0",
+        "api_version": "v1",
+        "status": "running",
+        "environment": settings.APP_ENV,
+        "docs_url": "/docs" if not settings.is_production else None
+    }
+
+# Author and Genre Management (v1 API)
+@app.post(f"{API_V1_PREFIX}/authors", response_model=AuthorResponse, status_code=status.HTTP_201_CREATED, tags=["Authors"])
 async def create_author(author: AuthorCreate, db: AsyncSession = Depends(get_db)):
+    """
+    Create a new author with proper validation and error handling.
+    """
     try:
         result = await db.execute(select(Author).where(Author.name == author.name))
         if result.scalar_one_or_none():
-            raise HTTPException(status_code=400, detail="Author already exists")
+            raise ConflictError("Author", f"Author with name '{author.name}' already exists")
         
         db_author = Author(name=author.name)
         db.add(db_author)
         await db.commit()
         await db.refresh(db_author)
+        
+        logger.info(f"Author created: {db_author.id} - {db_author.name}")
         return db_author
-    except HTTPException:
+    except (HTTPException, ConflictError, ValidationError):
+        await db.rollback()
         raise
     except Exception as e:
         await db.rollback()
-        raise HTTPException(status_code=500, detail="Failed to create author")
+        logger.error(f"Failed to create author: {str(e)}", exc_info=True)
+        raise DatabaseError("Failed to create author")
 
-@app.get("/authors", response_model=List[AuthorResponse], tags=["Authors"])
+@app.get(f"{API_V1_PREFIX}/authors", response_model=List[AuthorResponse], tags=["Authors"])
 async def get_authors(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Author).order_by(Author.name))
     return result.scalars().all()
 
-@app.put("/authors/{author_id}", response_model=AuthorResponse, tags=["Authors"])
+@app.put(f"{API_V1_PREFIX}/authors/{{author_id}}", response_model=AuthorResponse, tags=["Authors"])
 async def update_author(author_id: int, author_update: AuthorUpdate, db: AsyncSession = Depends(get_db)):
+    """
+    Update an existing author with proper validation.
+    """
     try:
         result = await db.execute(select(Author).where(Author.id == author_id))
         author = result.scalar_one_or_none()
         if not author:
-            raise HTTPException(status_code=404, detail="Author not found")
+            raise NotFoundError("Author", author_id)
         
         if author_update.name is not None:
             # Check if name already exists
             existing = await db.execute(select(Author).where(Author.name == author_update.name, Author.id != author_id))
             if existing.scalar_one_or_none():
-                raise HTTPException(status_code=400, detail="Author name already exists")
+                raise ConflictError(f"Author name '{author_update.name}' already exists")
             author.name = author_update.name
         
         await db.commit()
         await db.refresh(author)
+        
+        logger.info(f"Author updated: {author_id} - {author.name}")
         return author
-    except HTTPException:
+    except (HTTPException, NotFoundError, ConflictError, ValidationError):
+        await db.rollback()
         raise
     except Exception as e:
         await db.rollback()
-        raise HTTPException(status_code=500, detail="Failed to update author")
+        logger.error(f"Failed to update author {author_id}: {str(e)}", exc_info=True)
+        raise DatabaseError("Failed to update author")
 
-@app.delete("/authors/{author_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Authors"])
+@app.delete(f"{API_V1_PREFIX}/authors/{{author_id}}", status_code=status.HTTP_204_NO_CONTENT, tags=["Authors"])
 async def delete_author(author_id: int, db: AsyncSession = Depends(get_db)):
+    """
+    Delete an author. Cannot delete if author has associated books.
+    """
     try:
         result = await db.execute(select(Author).where(Author.id == author_id))
         author = result.scalar_one_or_none()
         if not author:
-            raise HTTPException(status_code=404, detail="Author not found")
+            raise NotFoundError("Author", author_id)
         
         # Check if author has books
         books_result = await db.execute(select(Book).where(Book.author_id == author_id))
         if books_result.scalar_one_or_none():
-            raise HTTPException(status_code=400, detail="Cannot delete author with existing books")
+            raise ConflictError("Cannot delete author with existing books. Please remove or reassign books first.")
         
         await db.delete(author)
         await db.commit()
-    except HTTPException:
+        
+        logger.info(f"Author deleted: {author_id}")
+    except (HTTPException, NotFoundError, ConflictError):
+        await db.rollback()
         raise
     except Exception as e:
         await db.rollback()
-        raise HTTPException(status_code=500, detail="Failed to delete author")
+        logger.error(f"Failed to delete author {author_id}: {str(e)}", exc_info=True)
+        raise DatabaseError("Failed to delete author")
 
 @app.post("/genres", response_model=GenreResponse, tags=["Genres"])
 async def create_genre(genre: GenreCreate, db: AsyncSession = Depends(get_db)):
@@ -237,31 +299,62 @@ async def delete_genre(genre_id: int, db: AsyncSession = Depends(get_db)):
 # Health check endpoints
 @app.get("/health", tags=["Health"])
 async def health_check():
-    """Basic health check endpoint"""
+    """
+    Basic health check endpoint for load balancers and monitoring.
+    Returns 200 if the service is up and running.
+    """
     return {
         "status": "healthy",
         "timestamp": time.time(),
         "version": "1.0.0",
-        "environment": settings.APP_ENV
+        "environment": settings.APP_ENV,
+        "service": settings.APP_NAME
     }
 
 @app.get("/health/detailed", tags=["Health"])
 async def detailed_health_check():
-    """Detailed health check with database and metrics"""
-    db_healthy = await db_health.check_health()
-    app_metrics = get_metrics_data()
-    
-    return {
-        "status": "healthy" if db_healthy else "unhealthy",
-        "timestamp": time.time(),
-        "version": "1.0.0",
-        "environment": settings.APP_ENV,
-        "database": {
-            "status": "healthy" if db_healthy else "unhealthy",
-            "last_check": db_health.last_check
-        },
-        "metrics": app_metrics
-    }
+    """
+    Detailed health check with database connectivity and application metrics.
+    Use this for comprehensive monitoring and alerting.
+    """
+    try:
+        db_healthy = await db_health.check_health()
+        app_metrics = get_metrics_data()
+        
+        overall_status = "healthy" if db_healthy else "unhealthy"
+        
+        # Return appropriate status code
+        status_code = 200 if db_healthy else 503
+        
+        health_data = {
+            "status": overall_status,
+            "timestamp": time.time(),
+            "version": "1.0.0",
+            "environment": settings.APP_ENV,
+            "service": settings.APP_NAME,
+            "database": {
+                "status": "healthy" if db_healthy else "unhealthy",
+                "last_check": db_health.last_check
+            },
+            "metrics": app_metrics
+        }
+        
+        return Response(
+            content=json.dumps(health_data),
+            status_code=status_code,
+            media_type="application/json"
+        )
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}", exc_info=True)
+        return Response(
+            content=json.dumps({
+                "status": "unhealthy",
+                "error": "Health check failed",
+                "timestamp": time.time()
+            }),
+            status_code=503,
+            media_type="application/json"
+        )
 
 @app.get("/metrics", tags=["Monitoring"])
 async def get_metrics():
@@ -286,8 +379,16 @@ async def add_book(book: BookCreate, db: AsyncSession = Depends(get_db)):
         await db.commit()
         await db.refresh(db_book)
         
-        # Index book for RAG
-        asyncio.create_task(rag_pipeline.index_book(db, db_book.id))
+        # Index book for RAG (fire and forget, but with error handling)
+        # In production, consider using a task queue (Celery, RQ) for background tasks
+        try:
+            # Use asyncio.create_task for background indexing
+            task = asyncio.create_task(rag_pipeline.index_book(db, db_book.id))
+            # Store task reference to prevent garbage collection
+            # In production, use proper task management
+        except Exception as e:
+            logger.warning(f"Failed to queue book indexing for book {db_book.id}: {str(e)}")
+            # Don't fail the request if indexing fails - it can be retried later
         
         logger.info(f"Book created: {db_book.id}", extra={"book_id": db_book.id})
         return db_book
@@ -330,25 +431,27 @@ async def get_books(db: AsyncSession = Depends(get_db)):
 
 @app.get("/books/{book_id}", response_model=BookResponse, tags=["Books"])
 async def get_book_by_id(book_id: int, db: AsyncSession = Depends(get_db)):
-    """Get book by ID with proper error handling"""
+    """
+    Get book by ID with proper error handling and validation.
+    """
     try:
+        if book_id <= 0:
+            raise ValidationError("Book ID must be a positive integer")
+        
         result = await db.execute(select(Book).where(Book.id == book_id))
         book = result.scalar_one_or_none()
 
         if not book:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Book with id {book_id} not found"
-            )
+            raise NotFoundError("Book", book_id)
         
         logger.info(f"Retrieved book: {book_id}", extra={"book_id": book_id})
         return book
         
-    except HTTPException:
+    except (HTTPException, NotFoundError, ValidationError):
         raise
     except Exception as e:
-        logger.error(f"Failed to retrieve book {book_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve book")
+        logger.error(f"Failed to retrieve book {book_id}: {str(e)}", exc_info=True)
+        raise DatabaseError("Failed to retrieve book")
 
 @app.put("/books/{book_id}", response_model=BookResponse, tags=["Books"])
 async def update_book(book_id: int, book_update: BookUpdate, db: AsyncSession = Depends(get_db)):

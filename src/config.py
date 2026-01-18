@@ -25,10 +25,46 @@ class Settings(BaseSettings):
     DB_MAX_OVERFLOW: int = Field(default=30, description="Database max overflow connections")
     
     # Security
-    SECRET_KEY: str = Field(default="super-secret-key-change-in-production", description="JWT secret key")
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=60, description="JWT token expiration")
+    SECRET_KEY: str = Field(
+        default="super-secret-key-change-in-production",
+        description="JWT secret key - MUST be changed in production"
+    )
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=60, description="JWT token expiration in minutes")
+    REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=7, description="Refresh token expiration in days")
     BASIC_AUTH_USERNAME: str = Field(default="admin", description="Basic auth username")
     BASIC_AUTH_PASSWORD: str = Field(default="password", description="Basic auth password")
+    
+    @validator('SECRET_KEY', pre=True)
+    def validate_secret_key(cls, v, values):
+        """Ensure secret key is secure in production"""
+        # Get APP_ENV from values dict (Pydantic v1) or from field values
+        env = values.get('APP_ENV', 'development')
+        if env == 'production':
+            if not v or v == "super-secret-key-change-in-production" or len(v) < 32:
+                raise ValueError(
+                    "SECRET_KEY must be at least 32 characters long and changed from default in production"
+                )
+        return v
+    
+    @validator('DB_PASSWORD')
+    def validate_db_password(cls, v, values):
+        """Ensure database password is set in production"""
+        env = values.get('APP_ENV', 'development')
+        if env == 'production' and (not v or v == 'password'):
+            raise ValueError("DB_PASSWORD must be set to a secure value in production")
+        return v
+    
+    @validator('CORS_ORIGINS')
+    def validate_cors_origins(cls, v, values):
+        """Ensure CORS origins are configured in production"""
+        env = values.get('APP_ENV', 'development')
+        if env == 'production' and ('*' in v or 'http://localhost' in str(v)):
+            import warnings
+            warnings.warn(
+                "CORS_ORIGINS contains wildcard or localhost in production. "
+                "This is a security risk. Configure specific allowed origins."
+            )
+        return v
     
     # External APIs
     OPENROUTER_API_KEY: str = Field(default="dummy_key", description="OpenRouter API key")
